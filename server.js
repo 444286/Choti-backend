@@ -179,10 +179,35 @@ app.get('/api/stories', async (req, res) => {
 // IMPORTANT: keep this route BEFORE /api/stories/:id
 app.get('/api/stories/slug/:slug', async (req, res) => {
   try {
-    const story = await Story.findOne({
-      slug: req.params.slug,
+    const requestedSlug = String(req.params.slug || '').trim();
+    let story = await Story.findOne({
+      slug: requestedSlug,
       status: 'published'
     });
+
+    // Backward-compatible fallback for older stories that were created
+    // before the slug field existed. This lets their clean title URL work
+    // even before the startup migration has completed.
+    if (!story) {
+      const candidates = await Story.find({ status: 'published' })
+        .select('_id title slug author content excerpt image imagePublicId categories tags views isHot isNew status createdAt updatedAt')
+        .lean();
+
+      const match = candidates.find(item => makeBaseSlug(item.title) === requestedSlug);
+
+      if (match) {
+        story = await Story.findById(match._id);
+
+        if (!story.slug) {
+          try {
+            const newSlug = await generateUniqueSlug(story.title, story._id);
+            story.slug = newSlug;
+            await Story.updateOne({ _id: story._id }, { $set: { slug: newSlug } });
+          } catch (_) {}
+        }
+      }
+    }
+
     if (!story) return res.status(404).json({ error: 'Story not found' });
 
     await Story.findByIdAndUpdate(story._id, { $inc: { views: 1 } });

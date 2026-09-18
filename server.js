@@ -4,8 +4,8 @@ const cors = require('cors');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
-const path = require('path');
 const { slugify } = require('transliteration');
+const path = require('path');
 require('dotenv').config();
 
 const app = express();
@@ -34,10 +34,6 @@ const upload = multer({
 });
 
 // ===== MONGODB CONNECTION =====
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('✅ MongoDB Connected'))
-  .catch(err => console.error('❌ MongoDB Error:', err));
-
 // ===== STORY SCHEMA =====
 const storySchema = new mongoose.Schema({
   title: { type: String, required: true },
@@ -103,52 +99,41 @@ app.post('/api/admin/login', async (req, res) => {
   }
 });
 
-// ===== STORY SLUG HELPERS =====
+// ===== SLUG HELPERS =====
 function makeBaseSlug(title) {
-  let slug = slugify(String(title || ''), { lowercase: true, separator: '-' });
+  let slug = slugify(title || '', { lowercase: true, separator: '-', trim: true });
   slug = slug
     .replace(/-/g, '_')
     .replace(/[^a-zA-Z0-9_]/g, '')
     .replace(/_+/g, '_')
     .replace(/^_+|_+$/g, '');
-  return slug || 'story';
+  return slug;
 }
 
 async function generateUniqueSlug(title, excludeId = null) {
-  const base = makeBaseSlug(title);
-  let slug = base;
-  let counter = 2;
+  let baseSlug = makeBaseSlug(title);
+  if (!baseSlug) baseSlug = 'story';
 
+  let slug = baseSlug;
+  let counter = 2;
   while (true) {
     const query = { slug };
     if (excludeId) query._id = { $ne: excludeId };
-    const exists = await Story.exists(query);
+    const exists = await Story.findOne(query).select('_id').lean();
     if (!exists) return slug;
-    slug = `${base}_${counter++}`;
+    slug = `${baseSlug}_${counter++}`;
   }
 }
 
 async function migrateStorySlugs() {
-  try {
-    const stories = await Story.find({
-      $or: [
-        { slug: { $exists: false } },
-        { slug: null },
-        { slug: '' }
-      ]
-    }).sort({ createdAt: 1 });
+  const stories = await Story.find({
+    $or: [{ slug: { $exists: false } }, { slug: '' }, { slug: null }]
+  }).sort({ createdAt: 1 });
 
-    if (!stories.length) return;
-
-    console.log(`🔄 Generating slugs for ${stories.length} existing stories...`);
-    for (const story of stories) {
-      story.slug = await generateUniqueSlug(story.title, story._id);
-      await story.save();
-      console.log(`   ✅ ${story.title} → /${story.slug}/`);
-    }
-    console.log('✅ Existing story slugs completed');
-  } catch (err) {
-    console.error('❌ Slug migration error:', err.message);
+  for (const story of stories) {
+    const slug = await generateUniqueSlug(story.title, story._id);
+    await Story.updateOne({ _id: story._id }, { $set: { slug } });
+    console.log(`🔗 Slug created: ${story.title} -> ${slug}`);
   }
 }
 
@@ -190,22 +175,25 @@ app.get('/api/stories', async (req, res) => {
   }
 });
 
-// GET single story by clean URL slug
+// GET single story by clean slug
+// IMPORTANT: keep this route BEFORE /api/stories/:id
 app.get('/api/stories/slug/:slug', async (req, res) => {
   try {
-    const story = await Story.findOne({ slug: req.params.slug, status: 'published' });
+    const story = await Story.findOne({
+      slug: req.params.slug,
+      status: 'published'
+    });
     if (!story) return res.status(404).json({ error: 'Story not found' });
 
     await Story.findByIdAndUpdate(story._id, { $inc: { views: 1 } });
     story.views = (story.views || 0) + 1;
-
     res.json(story);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET single story by MongoDB ID (old links remain supported)
+// GET single story
 app.get('/api/stories/:id', async (req, res) => {
   try {
     const story = await Story.findById(req.params.id);
@@ -241,11 +229,9 @@ app.post('/api/admin/stories', adminAuth, upload.single('image'), async (req, re
     const cleanContent = content.replace(/<[^>]*>/g, '').substring(0, 150);
     const excerpt = cleanContent + '...';
 
-    const slug = await generateUniqueSlug(title);
-
     const storyData = {
       title,
-      slug,
+      slug: await generateUniqueSlug(title),
       author: author || 'অজ্ঞাত',
       content,
       excerpt,
@@ -277,6 +263,7 @@ app.put('/api/admin/stories/:id', adminAuth, upload.single('image'), async (req,
 
     const updateData = {
       title,
+      slug: await generateUniqueSlug(title, req.params.id),
       author,
       content,
       categories: categories ? JSON.parse(categories) : [],
@@ -295,7 +282,7 @@ app.put('/api/admin/stories/:id', adminAuth, upload.single('image'), async (req,
 
     if (req.file) {
       // Delete old image from cloudinary
-      const oldStory = oldStoryForUpdate;
+      const oldStory = await Story.findById(req.params.id);
       if (oldStory && oldStory.imagePublicId) {
         await cloudinary.uploader.destroy(oldStory.imagePublicId);
       }
@@ -433,8 +420,17 @@ async function seedCategories() {
   }
 }
 
-app.listen(PORT, async () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  await seedCategories();
-  await migrateStorySlugs();
-});
+async function startServer() {
+  try {
+    await mongoose.connect(process.env.MONGODB_URI);
+    console.log('✅ MongoDB Connected');
+    await seedCategories();
+    await migrateStorySlugs();
+    app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+  } catch (err) {
+    console.error('❌ Startup Error:', err);
+    process.exit(1);
+  }
+}
+
+startServer();

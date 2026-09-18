@@ -224,8 +224,17 @@ app.get('/api/stories/:id', async (req, res) => {
     const story = await Story.findById(req.params.id);
     if (!story) return res.status(404).json({ error: 'Story not found' });
 
+    // Ensure older posts also have a clean title-based slug.
+    if (!story.slug) {
+      try {
+        story.slug = await generateUniqueSlug(story.title, story._id);
+        await Story.updateOne({ _id: story._id }, { $set: { slug: story.slug } });
+      } catch (e) {}
+    }
+
     // Increment views
     await Story.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } });
+    story.views = (story.views || 0) + 1;
 
     res.json(story);
   } catch (err) {

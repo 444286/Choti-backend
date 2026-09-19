@@ -4,8 +4,8 @@ const cors = require('cors');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
-const { slugify } = require('transliteration');
 const path = require('path');
+const { slugify } = require('transliteration');
 require('dotenv').config();
 
 const app = express();
@@ -34,16 +34,20 @@ const upload = multer({
 });
 
 // ===== MONGODB CONNECTION =====
+mongoose.connect(process.env.MONGODB_URI)
+  .then(async () => { console.log('✅ MongoDB Connected'); await migrateStorySlugs(); })
+  .catch(err => console.error('❌ MongoDB Error:', err));
+
 // ===== STORY SCHEMA =====
 const storySchema = new mongoose.Schema({
   title: { type: String, required: true },
-  slug: { type: String, unique: true, sparse: true, index: true },
   author: { type: String, default: 'অজ্ঞাত' },
   content: { type: String, required: true },
   excerpt: { type: String },
   image: { type: String, default: '' },
   imagePublicId: { type: String, default: '' },
   categories: [{ type: String }],
+  slug: { type: String, unique: true, sparse: true, index: true },
   tags: [{ type: String }],
   views: { type: Number, default: 0 },
   isHot: { type: Boolean, default: false },
@@ -54,6 +58,52 @@ const storySchema = new mongoose.Schema({
 });
 
 const Story = mongoose.model('Story', storySchema);
+
+
+// ===== SERIES / RELATED STORY HELPERS =====
+function parseSeriesTitle(title) {
+  const raw = String(title || '').trim();
+  // Supports: "পর্ব ১", "- পর্ব ১", "Part 1", "Episode 1"
+  const m = raw.match(/^(.*?)(?:\s*[-–—:|]?\s*)(?:পর্ব|part|episode)\s*([0-9০-৯]+)\s*$/i);
+  if (!m) return { base: null, part: null };
+  const bn = '০১২৩৪৫৬৭৮৯';
+  const part = Number(String(m[2]).replace(/[০-৯]/g, d => bn.indexOf(d)));
+  return { base: m[1].trim().replace(/[\s_-]+$/g, ''), part: Number.isFinite(part) ? part : null };
+}
+
+function sameSeriesBase(a, b) {
+  return String(a || '').trim().toLocaleLowerCase('bn-BD') === String(b || '').trim().toLocaleLowerCase('bn-BD');
+}
+
+
+function makeBaseSlug(title) {
+  let slug = slugify(String(title || ''), { lowercase: true, separator: '-', trim: true });
+  slug = slug.replace(/-/g, '_').replace(/[^a-zA-Z0-9_]/g, '').replace(/_+/g, '_').replace(/^_+|_+$/g, '');
+  return slug || 'story';
+}
+
+async function generateUniqueSlug(title, excludeId = null) {
+  const base = makeBaseSlug(title);
+  let slug = base;
+  let n = 2;
+  while (true) {
+    const query = excludeId ? { slug, _id: { $ne: excludeId } } : { slug };
+    const exists = await Story.findOne(query).select('_id').lean();
+    if (!exists) return slug;
+    slug = `${base}_${n++}`;
+  }
+}
+
+async function migrateStorySlugs() {
+  const stories = await Story.find({
+    $or: [{ slug: { $exists: false } }, { slug: '' }, { slug: null }]
+  }).sort({ createdAt: 1 });
+  for (const story of stories) {
+    story.slug = await generateUniqueSlug(story.title, story._id);
+    await story.save();
+  }
+  if (stories.length) console.log(`🔗 Created slugs for ${stories.length} stories`);
+}
 
 // ===== CATEGORY SCHEMA =====
 const categorySchema = new mongoose.Schema({
@@ -99,44 +149,6 @@ app.post('/api/admin/login', async (req, res) => {
   }
 });
 
-// ===== SLUG HELPERS =====
-function makeBaseSlug(title) {
-  let slug = slugify(title || '', { lowercase: true, separator: '-', trim: true });
-  slug = slug
-    .replace(/-/g, '_')
-    .replace(/[^a-zA-Z0-9_]/g, '')
-    .replace(/_+/g, '_')
-    .replace(/^_+|_+$/g, '');
-  return slug;
-}
-
-async function generateUniqueSlug(title, excludeId = null) {
-  let baseSlug = makeBaseSlug(title);
-  if (!baseSlug) baseSlug = 'story';
-
-  let slug = baseSlug;
-  let counter = 2;
-  while (true) {
-    const query = { slug };
-    if (excludeId) query._id = { $ne: excludeId };
-    const exists = await Story.findOne(query).select('_id').lean();
-    if (!exists) return slug;
-    slug = `${baseSlug}_${counter++}`;
-  }
-}
-
-async function migrateStorySlugs() {
-  const stories = await Story.find({
-    $or: [{ slug: { $exists: false } }, { slug: '' }, { slug: null }]
-  }).sort({ createdAt: 1 });
-
-  for (const story of stories) {
-    const slug = await generateUniqueSlug(story.title, story._id);
-    await Story.updateOne({ _id: story._id }, { $set: { slug } });
-    console.log(`🔗 Slug created: ${story.title} -> ${slug}`);
-  }
-}
-
 // ===== PUBLIC API ROUTES =====
 
 // GET all stories (with pagination + filter)
@@ -175,41 +187,75 @@ app.get('/api/stories', async (req, res) => {
   }
 });
 
-// GET single story by clean slug
-// IMPORTANT: keep this route BEFORE /api/stories/:id
-app.get('/api/stories/slug/:slug', async (req, res) => {
+// GET series parts + related stories for a story page
+// Must stay before /api/stories/:id so "related" is not treated as an ID.
+app.get('/api/stories/related/:id', async (req, res) => {
   try {
-    const requestedSlug = String(req.params.slug || '').trim();
-    let story = await Story.findOne({
-      slug: requestedSlug,
-      status: 'published'
-    });
+    const current = await Story.findOne({ _id: req.params.id, status: 'published' })
+      .select('title categories');
+    if (!current) return res.status(404).json({ error: 'Story not found' });
 
-    // Backward-compatible fallback for older stories that were created
-    // before the slug field existed. This lets their clean title URL work
-    // even before the startup migration has completed.
-    if (!story) {
-      const candidates = await Story.find({ status: 'published' })
-        .select('_id title slug author content excerpt image imagePublicId categories tags views isHot isNew status createdAt updatedAt')
-        .lean();
+    const currentInfo = parseSeriesTitle(current.title);
+    let seriesParts = [];
 
-      const match = candidates.find(item => makeBaseSlug(item.title) === requestedSlug);
+    if (currentInfo.base && currentInfo.part !== null) {
+      const candidates = await Story.find({
+        status: 'published',
+        _id: { $ne: current._id }
+      }).select('title slug categories createdAt');
 
-      if (match) {
-        story = await Story.findById(match._id);
+      seriesParts = candidates
+        .map(story => ({ story, info: parseSeriesTitle(story.title) }))
+        .filter(x => x.info.base && x.info.part !== null && sameSeriesBase(x.info.base, currentInfo.base))
+        .sort((a, b) => a.info.part - b.info.part)
+        .map(x => ({
+          _id: x.story._id,
+          title: x.story.title,
+          slug: x.story.slug || '',
+          part: x.info.part
+        }));
+    }
 
-        if (!story.slug) {
-          try {
-            const newSlug = await generateUniqueSlug(story.title, story._id);
-            story.slug = newSlug;
-            await Story.updateOne({ _id: story._id }, { $set: { slug: newSlug } });
-          } catch (_) {}
-        }
+    // If the series has fewer than 5 parts in total, fill the remaining slots
+    // with other published stories sharing at least one category.
+    const totalSeriesParts = seriesParts.length + 1;
+    let relatedStories = [];
+
+    if (totalSeriesParts < 5) {
+      const excludedIds = [current._id, ...seriesParts.map(p => p._id)];
+      const categoryList = Array.isArray(current.categories) ? current.categories : [];
+
+      if (categoryList.length) {
+        relatedStories = await Story.find({
+          status: 'published',
+          _id: { $nin: excludedIds },
+          categories: { $in: categoryList }
+        })
+          .sort({ views: -1, createdAt: -1 })
+          .limit(5 - totalSeriesParts)
+          .select('title slug categories createdAt views');
       }
     }
 
-    if (!story) return res.status(404).json({ error: 'Story not found' });
+    res.json({
+      series: {
+        hasSeries: currentInfo.base !== null && currentInfo.part !== null,
+        currentPart: currentInfo.part,
+        totalParts: totalSeriesParts,
+        parts: seriesParts
+      },
+      related: relatedStories
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
+// GET single published story by slug
+app.get('/api/stories/slug/:slug', async (req, res) => {
+  try {
+    const story = await Story.findOne({ slug: req.params.slug, status: 'published' });
+    if (!story) return res.status(404).json({ error: 'Story not found' });
     await Story.findByIdAndUpdate(story._id, { $inc: { views: 1 } });
     story.views = (story.views || 0) + 1;
     res.json(story);
@@ -224,17 +270,8 @@ app.get('/api/stories/:id', async (req, res) => {
     const story = await Story.findById(req.params.id);
     if (!story) return res.status(404).json({ error: 'Story not found' });
 
-    // Ensure older posts also have a clean title-based slug.
-    if (!story.slug) {
-      try {
-        story.slug = await generateUniqueSlug(story.title, story._id);
-        await Story.updateOne({ _id: story._id }, { $set: { slug: story.slug } });
-      } catch (e) {}
-    }
-
     // Increment views
     await Story.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } });
-    story.views = (story.views || 0) + 1;
 
     res.json(story);
   } catch (err) {
@@ -454,17 +491,7 @@ async function seedCategories() {
   }
 }
 
-async function startServer() {
-  try {
-    await mongoose.connect(process.env.MONGODB_URI);
-    console.log('✅ MongoDB Connected');
-    await seedCategories();
-    await migrateStorySlugs();
-    app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-  } catch (err) {
-    console.error('❌ Startup Error:', err);
-    process.exit(1);
-  }
-}
-
-startServer();
+app.listen(PORT, async () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  await seedCategories();
+});

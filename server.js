@@ -34,15 +34,13 @@ const upload = multer({
 
 // ===== MONGODB CONNECTION =====
 mongoose.connect(process.env.MONGODB_URI)
-  .then(async () => {
-    console.log('✅ MongoDB Connected');
-    await syncDefaultCategories();
-  })
+  .then(() => console.log('✅ MongoDB Connected'))
   .catch(err => console.error('❌ MongoDB Error:', err));
 
 // ===== STORY SCHEMA =====
 const storySchema = new mongoose.Schema({
   title: { type: String, required: true },
+  slug: { type: String, unique: true, sparse: true, index: true },
   author: { type: String, default: 'অজ্ঞাত' },
   content: { type: String, required: true },
   excerpt: { type: String },
@@ -136,6 +134,42 @@ app.post('/api/admin/login', async (req, res) => {
   }
 });
 
+// ===== FIXED CATEGORY SYSTEM =====
+const FIXED_CATEGORIES = [
+  ['ojachar','অজাচার বাংলা চটি গল্প'],
+  ['kajer-mashi','কাজের মাসি চোদার গল্প'],
+  ['kajer-meye','কাজের মেয়ে চোদার গল্প'],
+  ['kumari-meye','কুমারী মেয়ে চোদার গল্প'],
+  ['grihobodhu','গৃহবধূ চোদন কাহিনী'],
+  ['gay','গে সেক্স চটি'],
+  ['gram-sex','গ্রাম সেক্সের বাংলা চটি গল্প'],
+  ['porkiya','পরকীয়া বাংলা চটি গল্প'],
+  ['mature','পরিপক্ক চোদাচুদি গল্প'],
+  ['protibeshi','প্রতিবেশী চোদার চটি গল্প'],
+  ['famous','ফেমাস বাংলা চটি গল্প'],
+  ['babaji','বাবাজী চোদার বাংলা চটি গল্প'],
+  ['somokami','সমকামী বাংলা চটি গল্প'],
+  ['best','সেরা বাংলা চটি'],
+  ['student','স্টুডেন্ট বাংলা চটি গল্প'],
+  ['swami-stri','স্বামী স্ত্রী বাংলা চটি গল্প'],
+  ['hijra','হিজরা শীলে বাংলা চটি গল্প']
+];
+const CATEGORY_ALIASES = {
+  'ojachar':['ojachar'], 'kajer-mashi':['kajer-mashi'], 'kajer-meye':['kajer-meye'],
+  'kumari-meye':['kumari-meye'], 'grihobodhu':['grihobodhu','grihobodhu','grihobodhu'],
+  'gay':['gay'], 'gram-sex':['gram-sex','gramsex'], 'porkiya':['porkiya','porokia','porokiya'],
+  'mature':['mature'], 'protibeshi':['protibeshi'], 'famous':['famous'], 'babaji':['babaji'],
+  'somokami':['somokami'], 'best':['best'], 'student':['student'], 'swami-stri':['swami-stri','swami_stri'],
+  'hijra':['hijra'], 'popular':['popular',''], 'new':['new'], 'real':['real'],
+  'teacher-student':['teacher-student'], 'wedding':['wedding'], 'office':['office']
+};
+
+async function ensureFixedCategories() {
+  for (const [slug,name] of FIXED_CATEGORIES) {
+    await Category.updateOne({slug}, {$set:{name}, $setOnInsert:{icon:'📖'}}, {upsert:true});
+  }
+}
+
 // ===== PUBLIC API ROUTES =====
 
 // GET all stories (with pagination + filter)
@@ -148,7 +182,10 @@ app.get('/api/stories', async (req, res) => {
     const sort = req.query.sort || 'newest';
 
     let query = { status: 'published' };
-    if (category) query.categories = { $in: [category] };
+    if (category) {
+      const aliases = CATEGORY_ALIASES[category] || [category];
+      query.categories = { $in: aliases };
+    }
     if (search) query.title = { $regex: search, $options: 'i' };
 
     let sortObj = {};
@@ -169,6 +206,18 @@ app.get('/api/stories', async (req, res) => {
       page,
       totalPages: Math.ceil(total / limit)
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET single story by slug
+app.get('/api/stories/slug/:slug', async (req, res) => {
+  try {
+    const story = await Story.findOne({ slug: req.params.slug });
+    if (!story) return res.status(404).json({ error: 'Story not found' });
+    await Story.findByIdAndUpdate(story._id, { $inc: { views: 1 } });
+    res.json(story);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -229,6 +278,10 @@ app.post('/api/admin/stories', adminAuth, upload.single('image'), async (req, re
 
     const story = new Story(storyData);
     await story.save();
+    if (!story.slug) {
+      story.slug = `story-${story._id}`;
+      await story.save();
+    }
 
     res.json({ success: true, story });
   } catch (err) {
@@ -380,23 +433,10 @@ app.get('/admin', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'admin.html'));
 });
 
-// Seed default categories if empty
+// Seed/update fixed categories
 async function seedCategories() {
-  const count = await Category.countDocuments();
-  if (count === 0) {
-    const defaults = [
-      { name: 'জনপ্রিয়', slug: 'popular', icon: '🔥' },
-      { name: 'নতুন গল্প', slug: 'new', icon: '💚' },
-      { name: 'বাস্তব ঘটনা', slug: 'real', icon: '📖' },
-      { name: 'পরকীয়া', slug: 'porkiya', icon: '💜' },
-      { name: 'গৃহবধু', slug: 'grihobodhu', icon: '👥' },
-      { name: 'শিক্ষক-ছাত্রী', slug: 'teacher-student', icon: '☕' },
-      { name: 'বিয়ের গল্প', slug: 'wedding', icon: '💍' },
-      { name: 'অফিস', slug: 'office', icon: '🏢' }
-    ];
-    await Category.insertMany(defaults);
-    console.log('✅ Default categories seeded');
-  }
+  await ensureFixedCategories();
+  console.log('✅ Fixed categories ready');
 }
 
 app.listen(PORT, async () => {

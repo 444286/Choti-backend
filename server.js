@@ -105,6 +105,26 @@ async function migrateStorySlugs() {
   if (stories.length) console.log(`🔗 Created slugs for ${stories.length} stories`);
 }
 
+async function migrateStoryCategoriesFromTags() {
+  const stories = await Story.find({
+    $or: [
+      { categories: { $exists: false } },
+      { categories: { $size: 0 } }
+    ],
+    tags: { $exists: true, $ne: [] }
+  });
+  let updated = 0;
+  for (const story of stories) {
+    const tagValues = Array.isArray(story.tags) ? story.tags.filter(Boolean).map(String) : [];
+    if (tagValues.length) {
+      story.categories = [...new Set(tagValues)];
+      await story.save();
+      updated++;
+    }
+  }
+  if (updated) console.log(`🏷️ Copied tags to categories for ${updated} stories`);
+}
+
 // ===== CATEGORY SCHEMA =====
 const categorySchema = new mongoose.Schema({
   name: { type: String, required: true },
@@ -192,7 +212,7 @@ app.get('/api/stories', async (req, res) => {
 app.get('/api/stories/related/:id', async (req, res) => {
   try {
     const current = await Story.findOne({ _id: req.params.id, status: 'published' })
-      .select('title categories');
+      .select('title categories tags');
     if (!current) return res.status(404).json({ error: 'Story not found' });
 
     const currentInfo = parseSeriesTitle(current.title);
@@ -223,7 +243,7 @@ app.get('/api/stories/related/:id', async (req, res) => {
 
     if (totalSeriesParts < 5) {
       const excludedIds = [current._id, ...seriesParts.map(p => p._id)];
-      const categoryList = Array.isArray(current.categories) ? current.categories : [];
+      const categoryList = (Array.isArray(current.categories) && current.categories.length) ? current.categories : (Array.isArray(current.tags) ? current.tags : []);
 
       if (categoryList.length) {
         relatedStories = await Story.find({
@@ -306,7 +326,7 @@ app.post('/api/admin/stories', adminAuth, upload.single('image'), async (req, re
       author: author || 'অজ্ঞাত',
       content,
       excerpt,
-      categories: categories ? JSON.parse(categories) : [],
+      categories: categories ? JSON.parse(categories) : (tags ? JSON.parse(tags) : []),
       tags: tags ? JSON.parse(tags) : [],
       isHot: isHot === 'true',
       isNew: isNew !== 'false',
@@ -337,7 +357,7 @@ app.put('/api/admin/stories/:id', adminAuth, upload.single('image'), async (req,
       slug: await generateUniqueSlug(title, req.params.id),
       author,
       content,
-      categories: categories ? JSON.parse(categories) : [],
+      categories: categories ? JSON.parse(categories) : (tags ? JSON.parse(tags) : []),
       tags: tags ? JSON.parse(tags) : [],
       isHot: isHot === 'true',
       isNew: isNew !== 'false',
@@ -497,6 +517,7 @@ app.listen(PORT, async () => {
     await mongoose.connection.asPromise();
     await seedCategories();
     await migrateStorySlugs();
+    await migrateStoryCategoriesFromTags();
   } catch (err) {
     console.error('❌ Startup database task failed:', err);
   }

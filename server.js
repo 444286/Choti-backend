@@ -155,7 +155,7 @@ app.post('/api/admin/login', async (req, res) => {
 app.get('/api/stories', async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
+    const limit = Math.min(15, Math.max(1, parseInt(req.query.limit) || 15));
     const category = req.query.category;
     const search = req.query.search;
     const sort = req.query.sort || 'newest';
@@ -232,7 +232,7 @@ app.get('/api/stories/related/:id', async (req, res) => {
           categories: { $in: categoryList }
         })
           .sort({ views: -1, createdAt: -1 })
-          .limit(Math.max(0, 5 - seriesParts.length))
+          .limit(5)
           .select('title slug categories createdAt views');
       }
     }
@@ -493,5 +493,11 @@ async function seedCategories() {
 
 app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  await seedCategories();
+  try {
+    await mongoose.connection.asPromise();
+    await seedCategories();
+    await migrateStorySlugs();
+  } catch (err) {
+    console.error('❌ Startup database task failed:', err);
+  }
 });

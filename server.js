@@ -232,7 +232,7 @@ app.get('/api/stories/related/:id', async (req, res) => {
           categories: { $in: categoryList }
         })
           .sort({ views: -1, createdAt: -1 })
-          .limit(5 - totalSeriesParts)
+          .limit(Math.max(0, 5 - seriesParts.length))
           .select('title slug categories createdAt views');
       }
     }

@@ -5,6 +5,7 @@ const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const path = require('path');
+const { slugify } = require('transliteration');
 require('dotenv').config();
 
 const app = express();
@@ -34,19 +35,19 @@ const upload = multer({
 
 // ===== MONGODB CONNECTION =====
 mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('✅ MongoDB Connected'))
+  .then(async () => { console.log('✅ MongoDB Connected'); await migrateStorySlugs(); })
   .catch(err => console.error('❌ MongoDB Error:', err));
 
 // ===== STORY SCHEMA =====
 const storySchema = new mongoose.Schema({
   title: { type: String, required: true },
-  slug: { type: String, unique: true, sparse: true, index: true },
   author: { type: String, default: 'অজ্ঞাত' },
   content: { type: String, required: true },
   excerpt: { type: String },
   image: { type: String, default: '' },
   imagePublicId: { type: String, default: '' },
   categories: [{ type: String }],
+  slug: { type: String, unique: true, sparse: true, index: true },
   tags: [{ type: String }],
   views: { type: Number, default: 0 },
   isHot: { type: Boolean, default: false },
@@ -58,6 +59,72 @@ const storySchema = new mongoose.Schema({
 
 const Story = mongoose.model('Story', storySchema);
 
+
+// ===== SERIES / RELATED STORY HELPERS =====
+function parseSeriesTitle(title) {
+  const raw = String(title || '').trim();
+  // Supports: "পর্ব ১", "- পর্ব ১", "Part 1", "Episode 1"
+  const m = raw.match(/^(.*?)(?:\s*[-–—:|]?\s*)(?:পর্ব|part|episode)\s*([0-9০-৯]+)\s*$/i);
+  if (!m) return { base: null, part: null };
+  const bn = '০১২৩৪৫৬৭৮৯';
+  const part = Number(String(m[2]).replace(/[০-৯]/g, d => bn.indexOf(d)));
+  return { base: m[1].trim().replace(/[\s_-]+$/g, ''), part: Number.isFinite(part) ? part : null };
+}
+
+function sameSeriesBase(a, b) {
+  return String(a || '').trim().toLocaleLowerCase('bn-BD') === String(b || '').trim().toLocaleLowerCase('bn-BD');
+}
+
+
+function makeBaseSlug(title) {
+  let slug = slugify(String(title || ''), { lowercase: true, separator: '-', trim: true });
+  slug = slug.replace(/-/g, '_').replace(/[^a-zA-Z0-9_]/g, '').replace(/_+/g, '_').replace(/^_+|_+$/g, '');
+  return slug || 'story';
+}
+
+async function generateUniqueSlug(title, excludeId = null) {
+  const base = makeBaseSlug(title);
+  let slug = base;
+  let n = 2;
+  while (true) {
+    const query = excludeId ? { slug, _id: { $ne: excludeId } } : { slug };
+    const exists = await Story.findOne(query).select('_id').lean();
+    if (!exists) return slug;
+    slug = `${base}_${n++}`;
+  }
+}
+
+async function migrateStorySlugs() {
+  const stories = await Story.find({
+    $or: [{ slug: { $exists: false } }, { slug: '' }, { slug: null }]
+  }).sort({ createdAt: 1 });
+  for (const story of stories) {
+    story.slug = await generateUniqueSlug(story.title, story._id);
+    await story.save();
+  }
+  if (stories.length) console.log(`🔗 Created slugs for ${stories.length} stories`);
+}
+
+async function migrateStoryCategoriesFromTags() {
+  const stories = await Story.find({
+    $or: [
+      { categories: { $exists: false } },
+      { categories: { $size: 0 } }
+    ],
+    tags: { $exists: true, $ne: [] }
+  });
+  let updated = 0;
+  for (const story of stories) {
+    const tagValues = Array.isArray(story.tags) ? story.tags.filter(Boolean).map(String) : [];
+    if (tagValues.length) {
+      story.categories = [...new Set(tagValues)];
+      await story.save();
+      updated++;
+    }
+  }
+  if (updated) console.log(`🏷️ Copied tags to categories for ${updated} stories`);
+}
+
 // ===== CATEGORY SCHEMA =====
 const categorySchema = new mongoose.Schema({
   name: { type: String, required: true },
@@ -65,38 +132,6 @@ const categorySchema = new mongoose.Schema({
   icon: { type: String, default: '📖' }
 });
 const Category = mongoose.model('Category', categorySchema);
-
-// ===== DEFAULT CATEGORY SYNC =====
-const DEFAULT_CATEGORIES = [
-  ['ojachar','অজাচার বাংলা চটি গল্প'],
-  ['kajer-mashi','কাজের মাসি চোদার গল্প'],
-  ['kajer-meye','কাজের মেয়ে চোদার গল্প'],
-  ['kumari-meye','কুমারী মেয়ে চোদার গল্প'],
-  ['grihobodhu','গৃহবধূ চোদন কাহিনী'],
-  ['gay','গে সেক্স চটি'],
-  ['gram-sex','গ্রাম সেক্সের বাংলা চটি গল্প'],
-  ['porkiya','পরকীয়া বাংলা চটি গল্প'],
-  ['mature','পরিপক্ক চোদাচুদি গল্প'],
-  ['protibeshi','প্রতিবেশী চোদার চটি গল্প'],
-  ['famous','ফেমাস বাংলা চটি গল্প'],
-  ['babaji','বাবাজী চোদার বাংলা চটি গল্প'],
-  ['somokami','সমকামী বাংলা চটি গল্প'],
-  ['best','সেরা বাংলা চটি'],
-  ['student','স্টুডেন্ট বাংলা চটি গল্প'],
-  ['swami-stri','স্বামী স্ত্রী বাংলা চটি গল্প'],
-  ['hijra','হিজরা শীলে বাংলা চটি গল্প']
-];
-
-async function syncDefaultCategories() {
-  for (const [slug, name] of DEFAULT_CATEGORIES) {
-    await Category.findOneAndUpdate(
-      { slug },
-      { $set: { name, icon: '📖' } },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
-  }
-  console.log('✅ Default categories synced');
-}
 
 // ===== ADMIN SCHEMA =====
 const adminSchema = new mongoose.Schema({
@@ -134,58 +169,19 @@ app.post('/api/admin/login', async (req, res) => {
   }
 });
 
-// ===== FIXED CATEGORY SYSTEM =====
-const FIXED_CATEGORIES = [
-  ['ojachar','অজাচার বাংলা চটি গল্প'],
-  ['kajer-mashi','কাজের মাসি চোদার গল্প'],
-  ['kajer-meye','কাজের মেয়ে চোদার গল্প'],
-  ['kumari-meye','কুমারী মেয়ে চোদার গল্প'],
-  ['grihobodhu','গৃহবধূ চোদন কাহিনী'],
-  ['gay','গে সেক্স চটি'],
-  ['gram-sex','গ্রাম সেক্সের বাংলা চটি গল্প'],
-  ['porkiya','পরকীয়া বাংলা চটি গল্প'],
-  ['mature','পরিপক্ক চোদাচুদি গল্প'],
-  ['protibeshi','প্রতিবেশী চোদার চটি গল্প'],
-  ['famous','ফেমাস বাংলা চটি গল্প'],
-  ['babaji','বাবাজী চোদার বাংলা চটি গল্প'],
-  ['somokami','সমকামী বাংলা চটি গল্প'],
-  ['best','সেরা বাংলা চটি'],
-  ['student','স্টুডেন্ট বাংলা চটি গল্প'],
-  ['swami-stri','স্বামী স্ত্রী বাংলা চটি গল্প'],
-  ['hijra','হিজরা শীলে বাংলা চটি গল্প']
-];
-const CATEGORY_ALIASES = {
-  'ojachar':['ojachar'], 'kajer-mashi':['kajer-mashi'], 'kajer-meye':['kajer-meye'],
-  'kumari-meye':['kumari-meye'], 'grihobodhu':['grihobodhu','grihobodhu','grihobodhu'],
-  'gay':['gay'], 'gram-sex':['gram-sex','gramsex'], 'porkiya':['porkiya','porokia','porokiya'],
-  'mature':['mature'], 'protibeshi':['protibeshi'], 'famous':['famous'], 'babaji':['babaji'],
-  'somokami':['somokami'], 'best':['best'], 'student':['student'], 'swami-stri':['swami-stri','swami_stri'],
-  'hijra':['hijra'], 'popular':['popular',''], 'new':['new'], 'real':['real'],
-  'teacher-student':['teacher-student'], 'wedding':['wedding'], 'office':['office']
-};
-
-async function ensureFixedCategories() {
-  for (const [slug,name] of FIXED_CATEGORIES) {
-    await Category.updateOne({slug}, {$set:{name}, $setOnInsert:{icon:'📖'}}, {upsert:true});
-  }
-}
-
 // ===== PUBLIC API ROUTES =====
 
 // GET all stories (with pagination + filter)
 app.get('/api/stories', async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
+    const limit = Math.min(15, Math.max(1, parseInt(req.query.limit) || 15));
     const category = req.query.category;
     const search = req.query.search;
     const sort = req.query.sort || 'newest';
 
     let query = { status: 'published' };
-    if (category) {
-      const aliases = CATEGORY_ALIASES[category] || [category];
-      query.categories = { $in: aliases };
-    }
+    if (category) query.categories = { $in: [category] };
     if (search) query.title = { $regex: search, $options: 'i' };
 
     let sortObj = {};
@@ -211,12 +207,77 @@ app.get('/api/stories', async (req, res) => {
   }
 });
 
-// GET single story by slug
+// GET series parts + related stories for a story page
+// Must stay before /api/stories/:id so "related" is not treated as an ID.
+app.get('/api/stories/related/:id', async (req, res) => {
+  try {
+    const current = await Story.findOne({ _id: req.params.id, status: 'published' })
+      .select('title categories tags');
+    if (!current) return res.status(404).json({ error: 'Story not found' });
+
+    const currentInfo = parseSeriesTitle(current.title);
+    let seriesParts = [];
+
+    if (currentInfo.base && currentInfo.part !== null) {
+      const candidates = await Story.find({
+        status: 'published',
+        _id: { $ne: current._id }
+      }).select('title slug categories createdAt');
+
+      seriesParts = candidates
+        .map(story => ({ story, info: parseSeriesTitle(story.title) }))
+        .filter(x => x.info.base && x.info.part !== null && sameSeriesBase(x.info.base, currentInfo.base))
+        .sort((a, b) => a.info.part - b.info.part)
+        .map(x => ({
+          _id: x.story._id,
+          title: x.story.title,
+          slug: x.story.slug || '',
+          part: x.info.part
+        }));
+    }
+
+    // If the series has fewer than 5 parts in total, fill the remaining slots
+    // with other published stories sharing at least one category.
+    const totalSeriesParts = seriesParts.length + 1;
+    let relatedStories = [];
+
+    if (totalSeriesParts < 5) {
+      const excludedIds = [current._id, ...seriesParts.map(p => p._id)];
+      const categoryList = (Array.isArray(current.categories) && current.categories.length) ? current.categories : (Array.isArray(current.tags) ? current.tags : []);
+
+      if (categoryList.length) {
+        relatedStories = await Story.find({
+          status: 'published',
+          _id: { $nin: excludedIds },
+          categories: { $in: categoryList }
+        })
+          .sort({ views: -1, createdAt: -1 })
+          .limit(5)
+          .select('title slug categories createdAt views');
+      }
+    }
+
+    res.json({
+      series: {
+        hasSeries: currentInfo.base !== null && currentInfo.part !== null,
+        currentPart: currentInfo.part,
+        totalParts: totalSeriesParts,
+        parts: seriesParts
+      },
+      related: relatedStories
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET single published story by slug
 app.get('/api/stories/slug/:slug', async (req, res) => {
   try {
-    const story = await Story.findOne({ slug: req.params.slug });
+    const story = await Story.findOne({ slug: req.params.slug, status: 'published' });
     if (!story) return res.status(404).json({ error: 'Story not found' });
     await Story.findByIdAndUpdate(story._id, { $inc: { views: 1 } });
+    story.views = (story.views || 0) + 1;
     res.json(story);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -261,10 +322,11 @@ app.post('/api/admin/stories', adminAuth, upload.single('image'), async (req, re
 
     const storyData = {
       title,
+      slug: await generateUniqueSlug(title),
       author: author || 'অজ্ঞাত',
       content,
       excerpt,
-      categories: categories ? JSON.parse(categories) : [],
+      categories: categories ? JSON.parse(categories) : (tags ? JSON.parse(tags) : []),
       tags: tags ? JSON.parse(tags) : [],
       isHot: isHot === 'true',
       isNew: isNew !== 'false',
@@ -278,10 +340,6 @@ app.post('/api/admin/stories', adminAuth, upload.single('image'), async (req, re
 
     const story = new Story(storyData);
     await story.save();
-    if (!story.slug) {
-      story.slug = `story-${story._id}`;
-      await story.save();
-    }
 
     res.json({ success: true, story });
   } catch (err) {
@@ -296,9 +354,10 @@ app.put('/api/admin/stories/:id', adminAuth, upload.single('image'), async (req,
 
     const updateData = {
       title,
+      slug: await generateUniqueSlug(title, req.params.id),
       author,
       content,
-      categories: categories ? JSON.parse(categories) : [],
+      categories: categories ? JSON.parse(categories) : (tags ? JSON.parse(tags) : []),
       tags: tags ? JSON.parse(tags) : [],
       isHot: isHot === 'true',
       isNew: isNew !== 'false',
@@ -433,13 +492,33 @@ app.get('/admin', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'admin.html'));
 });
 
-// Seed/update fixed categories
+// Seed default categories if empty
 async function seedCategories() {
-  await ensureFixedCategories();
-  console.log('✅ Fixed categories ready');
+  const count = await Category.countDocuments();
+  if (count === 0) {
+    const defaults = [
+      { name: 'জনপ্রিয়', slug: 'popular', icon: '🔥' },
+      { name: 'নতুন গল্প', slug: 'new', icon: '💚' },
+      { name: 'বাস্তব ঘটনা', slug: 'real', icon: '📖' },
+      { name: 'পরকীয়া', slug: 'porkiya', icon: '💜' },
+      { name: 'গৃহবধু', slug: 'grihobodhu', icon: '👥' },
+      { name: 'শিক্ষক-ছাত্রী', slug: 'teacher-student', icon: '☕' },
+      { name: 'বিয়ের গল্প', slug: 'wedding', icon: '💍' },
+      { name: 'অফিস', slug: 'office', icon: '🏢' }
+    ];
+    await Category.insertMany(defaults);
+    console.log('✅ Default categories seeded');
+  }
 }
 
 app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  await seedCategories();
+  try {
+    await mongoose.connection.asPromise();
+    await seedCategories();
+    await migrateStorySlugs();
+    await migrateStoryCategoriesFromTags();
+  } catch (err) {
+    console.error('❌ Startup database task failed:', err);
+  }
 });

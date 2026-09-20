@@ -711,6 +711,37 @@ app.get(
 );
 
 // =====================================================
+// PUBLIC SEO SITEMAP SOURCE
+// Returns only published story URLs. This does not change
+// any existing story lookup or routing behavior.
+// =====================================================
+
+app.get(
+  '/api/seo/sitemap',
+  async (req, res) => {
+    try {
+      const stories = await Story.find({
+        status: 'published',
+        slug: { $exists: true, $ne: '' }
+      })
+        .sort({ updatedAt: -1, createdAt: -1 })
+        .select('slug createdAt updatedAt')
+        .lean();
+
+      res.json({
+        stories: stories.map(story => ({
+          slug: story.slug,
+          createdAt: story.createdAt,
+          updatedAt: story.updatedAt
+        }))
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// =====================================================
 // GET SINGLE STORY BY SLUG
 // IMPORTANT SEO / URL ROUTE
 // =====================================================
